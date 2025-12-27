@@ -1,4 +1,4 @@
-module github.com/ikemen-engine/reisen
+module github.com/cybertwip/reisen
 
 go 1.17
 
