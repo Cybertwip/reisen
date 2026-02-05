@@ -113,51 +113,61 @@ func (media *Media) findStreams() error {
 			"couldn't find stream information")
 	}
 
-	innerStreams := unsafe.Slice(
-		media.ctx.streams, media.ctx.nb_streams)
+	// CRITICAL FIX: Use manual pointer arithmetic instead of unsafe.Slice.
+	// unsafe.Slice can panic or return garbage if the C memory layout 
+	// doesn't perfectly match what Go expects for a slice header.
+	if media.ctx.nb_streams > 0 && media.ctx.streams != nil {
+		// media.ctx.streams is a **AVStream (array of pointers)
+		basePtr := uintptr(unsafe.Pointer(media.ctx.streams))
+		ptrSize := unsafe.Sizeof(*media.ctx.streams)
 
-	for _, innerStream := range innerStreams {
-		codecParams := innerStream.codecpar
-		codec := C.avcodec_find_decoder(codecParams.codec_id)
+		for i := 0; i < int(media.ctx.nb_streams); i++ {
+			// *(basePtr + i * ptrSize)
+			elementAddr := basePtr + uintptr(i)*ptrSize
+			innerStream := *(**C.AVStream)(unsafe.Pointer(elementAddr))
 
-		if codec == nil {
-			unknownStream := new(UnknownStream)
-			unknownStream.inner = innerStream
-			unknownStream.codecParams = codecParams
-			unknownStream.media = media
+			if innerStream == nil {
+				continue
+			}
 
-			streams = append(streams, unknownStream)
+			codecParams := innerStream.codecpar
+			codec := C.avcodec_find_decoder(codecParams.codec_id)
 
-			continue
-		}
+			if codec == nil {
+				unknownStream := new(UnknownStream)
+				unknownStream.inner = innerStream
+				unknownStream.codecParams = codecParams
+				unknownStream.media = media
 
-		switch codecParams.codec_type {
-		case C.AVMEDIA_TYPE_VIDEO:
-			videoStream := new(VideoStream)
-			videoStream.inner = innerStream
-			videoStream.codecParams = codecParams
-			videoStream.codec = codec
-			videoStream.media = media
+				streams = append(streams, unknownStream)
+				continue
+			}
 
-			streams = append(streams, videoStream)
+			switch codecParams.codec_type {
+			case C.AVMEDIA_TYPE_VIDEO:
+				videoStream := new(VideoStream)
+				videoStream.inner = innerStream
+				videoStream.codecParams = codecParams
+				videoStream.codec = codec
+				videoStream.media = media
+				streams = append(streams, videoStream)
 
-		case C.AVMEDIA_TYPE_AUDIO:
-			audioStream := new(AudioStream)
-			audioStream.inner = innerStream
-			audioStream.codecParams = codecParams
-			audioStream.codec = codec
-			audioStream.media = media
+			case C.AVMEDIA_TYPE_AUDIO:
+				audioStream := new(AudioStream)
+				audioStream.inner = innerStream
+				audioStream.codecParams = codecParams
+				audioStream.codec = codec
+				audioStream.media = media
+				streams = append(streams, audioStream)
 
-			streams = append(streams, audioStream)
-
-		default:
-			unknownStream := new(UnknownStream)
-			unknownStream.inner = innerStream
-			unknownStream.codecParams = codecParams
-			unknownStream.codec = codec
-			unknownStream.media = media
-
-			streams = append(streams, unknownStream)
+			default:
+				unknownStream := new(UnknownStream)
+				unknownStream.inner = innerStream
+				unknownStream.codecParams = codecParams
+				unknownStream.codec = codec
+				unknownStream.media = media
+				streams = append(streams, unknownStream)
+			}
 		}
 	}
 
@@ -167,8 +177,6 @@ func (media *Media) findStreams() error {
 }
 
 // OpenDecode opens the media container for decoding.
-//
-// CloseDecode() should be called afterwards.
 func (media *Media) OpenDecode() error {
 	media.packet = C.av_packet_alloc()
 
@@ -188,13 +196,19 @@ func (media *Media) ReadPacket() (*Packet, bool, error) {
 		if status == C.int(ErrorAgain) {
 			return nil, true, nil
 		}
-
 		// No packets anymore.
 		return nil, false, nil
 	}
 
+	// Safety check for stream index bounds
+	streamIdx := int(media.packet.stream_index)
+	if streamIdx < 0 || streamIdx >= len(media.streams) {
+		// Packet from a stream we didn't index (or index mismatch)
+		return nil, true, nil
+	}
+
 	// Filter the packet if needed.
-	packetStream := media.streams[media.packet.stream_index]
+	packetStream := media.streams[streamIdx]
 	outPacket := media.packet
 
 	if packetStream.filter() != nil {
@@ -234,31 +248,38 @@ func (media *Media) ReadPacket() (*Packet, bool, error) {
 
 // CloseDecode closes the media container for decoding.
 func (media *Media) CloseDecode() error {
-	C.av_free(unsafe.Pointer(media.packet))
-	media.packet = nil
-
+	if media.packet != nil {
+		C.av_free(unsafe.Pointer(media.packet))
+		media.packet = nil
+	}
 	return nil
 }
 
 // Close closes the media container.
 func (media *Media) Close() {
-	C.avformat_free_context(media.ctx)
-	media.ctx = nil
+	if media.ctx != nil {
+		// Use close_input to properly free the context and IO
+		C.avformat_close_input(&media.ctx)
+		media.ctx = nil
+	}
 }
 
 // NewMedia returns a new media container analyzer
 // for the specified media file.
 func NewMedia(filename string) (*Media, error) {
+	// CRITICAL FIX: Do NOT use avformat_alloc_context() here.
+	// Let avformat_open_input allocate it by passing nil.
+	// If you alloc it manually and then open input, FFmpeg can 
+	// get into a corrupted state if the alloc version differs slightly 
+	// or if open_input overwrites flags incorrectly.
 	media := &Media{
-		ctx: C.avformat_alloc_context(),
-	}
-
-	if media.ctx == nil {
-		return nil, fmt.Errorf(
-			"couldn't create a new media context")
+		ctx: nil,
 	}
 
 	fname := C.CString(filename)
+	// We must free the C string after usage
+	defer C.free(unsafe.Pointer(fname))
+
 	status := C.avformat_open_input(&media.ctx, fname, nil, nil)
 
 	if status < 0 {
@@ -266,9 +287,9 @@ func NewMedia(filename string) (*Media, error) {
 			"couldn't open file %s", filename)
 	}
 
-	C.free(unsafe.Pointer(fname))
 	err := media.findStreams()
 	if err != nil {
+		C.avformat_close_input(&media.ctx)
 		return nil, err
 	}
 
